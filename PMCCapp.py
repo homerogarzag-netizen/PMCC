@@ -15,6 +15,7 @@ st.markdown("""
     .summary-card {
         background-color: #161b22; padding: 15px; border-radius: 8px; 
         border: 1px solid #30363d; text-align: center; height: 130px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
     .kpi-label {color: #8b949e; font-size: 0.75rem; font-weight: bold; text-transform: uppercase;}
     .kpi-value {color: #ffffff; font-size: 1.4rem; font-weight: bold; margin-top: 8px;}
@@ -42,30 +43,38 @@ with st.sidebar:
 def get_headers(): return {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
 
 def get_underlying(symbol):
-    if len(symbol) < 6: return symbol
+    if not symbol or len(symbol) < 6: return symbol
     match = re.match(r"([A-Z]+)", symbol)
     return match.group(1) if match else symbol
 
 def decode_occ(symbol):
-    """Extrae Tipo y Strike del símbolo OCC"""
-    if not symbol or len(symbol) < 15: return "STOCK", 0
+    """Extrae Símbolo, Tipo y Strike del símbolo OCC"""
+    if not symbol or len(symbol) < 15: 
+        return symbol, "STOCK", 0
     try:
+        # ROOT + DATE + C/P + STRIKE
         match = re.match(r"^([A-Z]+)(\d{6})([CP])(\d{8})$", symbol)
         if match:
+            u_sym = match.group(1)
             o_type = "CALL" if match.group(3) == "C" else "PUT"
             strike = float(match.group(4)) / 1000
-            return o_type, strike
+            return u_sym, o_type, strike
     except: pass
-    return "UNKNOWN", 0
+    return symbol, "UNKNOWN", 0
 
 # --- MOTOR DE DATOS ---
 def run_pmcc_audit():
     # 1. Datos Cuenta
     r_p = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
     if r_p.status_code != 200: return None
-    acct_id = r_p.json()['profile']['account'][0]['account_number'] if isinstance(r_p.json()['profile']['account'], list) else r_p.json()['profile']['account']['account_number']
+    
+    prof_data = r_p.json()['profile']['account']
+    if isinstance(prof_data, list):
+        acct_id = prof_data[0]['account_number']
+    else:
+        acct_id = prof_data['account_number']
 
-    # 2. Posiciones Actuales
+    # 2. Posiciones Abiertas
     r_pos = requests.get(f"{BASE_URL}/accounts/{acct_id}/positions", headers=get_headers())
     positions = r_pos.json().get('positions', {}).get('position', [])
     if not positions or positions == 'null': positions = []
@@ -101,7 +110,12 @@ def run_pmcc_audit():
             
             cost = abs(float(p.get('cost_basis', 0)))
             val = float(p['quantity']) * q_data.get('last', 0) * 100
-            acq_date = datetime.strptime(p.get('date_acquired', '2025-01-01')[:10], '%Y-%m-%d')
+            
+            # Parsear fecha de adquisición
+            try:
+                acq_date = datetime.strptime(p.get('date_acquired', '2025-01-01')[:10], '%Y-%m-%d')
+            except:
+                acq_date = datetime.now()
             
             if report[u_sym]["start_date"] is None or acq_date < report[u_sym]["start_date"]:
                 report[u_sym]["start_date"] = acq_date
@@ -118,10 +132,15 @@ def run_pmcc_audit():
     # B. Filtrar trades cerrados (Solo CALLS posteriores al LEAPS)
     for gl in gl_data:
         sym = gl.get('symbol', '')
-        u_sym, o_type, strike = decode_occ(sym)
+        u_sym, o_type, strike = decode_occ(sym) # <--- CORREGIDO: Ahora siempre devuelve 3 valores
         
         if u_sym in report and o_type == "CALL":
-            close_dt = datetime.strptime(gl.get('close_date', '2000-01-01')[:10], '%Y-%m-%d')
+            try:
+                close_dt = datetime.strptime(gl.get('close_date', '2000-01-01')[:10], '%Y-%m-%d')
+                open_dt = datetime.strptime(gl.get('open_date', '2000-01-01')[:10], '%Y-%m-%d')
+            except:
+                close_dt = open_dt = datetime.now()
+
             if close_dt >= report[u_sym]["start_date"]:
                 # Si no es el strike del LEAPS, es renta (Income)
                 is_leap = any(abs(strike - ls) < 0.5 for ls in report[u_sym]['leaps_strikes'])
@@ -130,12 +149,11 @@ def run_pmcc_audit():
                     report[u_sym]['realized_cc'] += gain
                     report[u_sym]['closed_list'].append({
                         "Cerrado": close_dt.strftime('%Y-%m-%d'),
-                        "Categoría": "INCOME (CC)",
                         "Tipo": "CALL",
                         "Qty": abs(int(float(gl.get('quantity', 0)))),
                         "Strike": strike,
                         "P/L": gain,
-                        "DIT": gl.get('term', '-')
+                        "DIT": (close_dt - open_dt).days
                     })
 
     # C. Corto Activo (Monitor de Jugo)
@@ -147,9 +165,15 @@ def run_pmcc_audit():
             strike = q.get('strike', 0)
             opt_p = q.get('last', 0)
             juice = opt_p - max(0, u_p - strike)
+            
+            try:
+                exp_dt = datetime.strptime(q['expiration_date'], '%Y-%m-%d')
+                dte = (exp_dt - datetime.now()).days
+            except: dte = 0
+
             report[u_sym]['active_short'] = {
                 "Strike": strike, "Price": opt_p, "Ext": juice,
-                "DTE": (datetime.strptime(q['expiration_date'], '%Y-%m-%d') - datetime.now()).days
+                "DTE": dte
             }
 
     return report
@@ -183,9 +207,9 @@ if TOKEN:
                 st.table(pd.DataFrame(d['leaps']).style.format({"Cost": "${:,.2f}", "Value": "${:,.2f}", "P/L": "${:,.2f}"}))
 
                 if d['active_short']:
-                    a = d['active_short']
-                    st.write(f"### 🥤 MONITOR DE JUGO: Strike {a['Strike']} | DTE: {a['DTE']} | **Extrínseco: ${a['Ext']:.2f}**")
-                    if a['Ext'] < 0.15: st.error("🚨 TIEMPO DE ROLEAR")
+                    ash = d['active_short']
+                    st.write(f"### 🥤 MONITOR DE JUGO: Strike {ash['Strike']} | DTE: {ash['DTE']} | **Extrínseco: ${ash['Ext']:.2f}**")
+                    if ash['Ext'] < 0.15: st.error("🚨 TIEMPO DE ROLEAR")
 
                 if d['closed_list']:
                     with st.expander(f"📔 Ver Trades Cerrados de la Campaña"):
@@ -193,6 +217,6 @@ if TOKEN:
                         st.dataframe(df_cl.style.format({"P/L": "${:,.2f}", "Strike": "{:.2f}"}), use_container_width=True)
                 st.divider()
         else:
-            st.warning("No se encontraron campañas PMCC activas.")
+            st.warning("No se encontraron campañas PMCC activas con LEAPS de Delta > 0.60.")
 else:
-    st.info("👈 Introduce tu Token de Tradier.")
+    st.info("👈 Introduce tu Token de Tradier para comenzar.")
