@@ -6,9 +6,9 @@ import re
 from datetime import datetime
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(layout="wide", page_title="PMCC CEO Command Center", page_icon="🛡️")
+st.set_page_config(layout="wide", page_title="PMCC Master Accountant Pro", page_icon="🛡️")
 
-# --- DISEÑO UI PREMIUM ---
+# --- DISEÑO UI PREMIUM (CSS) ---
 st.markdown("""
     <style>
     .stApp {background-color: #0e1117;}
@@ -46,13 +46,16 @@ with st.sidebar:
     env_mode = st.radio("Entorno", ["Producción (Real)", "Sandbox"])
     BASE_URL = "https://api.tradier.com/v1" if env_mode == "Producción (Real)" else "https://sandbox.tradier.com/v1"
     st.divider()
-    st.caption("v19.0.0 | Active Shorts Summary")
+    st.caption("v19.1.0 | Fixed Symbol & Keys")
 
 # --- FUNCIONES DE APOYO ---
 def get_headers(): return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
 
 def get_underlying_symbol(symbol):
+    """Extrae el ticker base (ej: HIMS27... -> HIMS)"""
+    if not symbol: return ""
     if len(symbol) < 6: return symbol
+    # Busca solo letras al inicio
     match = re.match(r"([A-Z]+)", symbol)
     return match.group(1) if match else symbol
 
@@ -84,20 +87,20 @@ def run_master_analysis():
     if not raw_pos or raw_pos == 'null': raw_pos = []
     if isinstance(raw_pos, dict): raw_pos = [raw_pos]
 
-    # 3. Ganancias Realizadas
+    # 3. Ganancias Realizadas (Gain/Loss)
     r_gl = requests.get(f"{BASE_URL}/accounts/{acct_id}/gainloss", headers=get_headers())
     gl_data = r_gl.json().get('gainloss', {}).get('closed_position', [])
     if isinstance(gl_data, dict): gl_data = [gl_data]
 
     # 4. Market Data
-    all_syms = list(set([p['symbol'] for p in raw_pos] + [get_underlying_symbol(p['symbol']) for p in raw_pos]))
+    all_syms = list(set([p['symbol'] for p in raw_pos] + [get_underlying_symbol(p['symbol']) for p in raw_pos] + ["SPY"]))
     r_q = requests.get(f"{BASE_URL}/markets/quotes", params={'symbols': ",".join(all_syms), 'greeks': 'true'}, headers=get_headers())
     m_map = {q['symbol']: q for q in r_q.json().get('quotes', {}).get('quote', [])} if r_q else {}
+    spy_p = float(m_map.get('SPY', {}).get('last', 685))
 
     report = {}
-    detailed_positions = []
 
-    # Identificar Leaps (>180 DTE)
+    # A. Identificar Leaps (>180 DTE)
     for p in raw_pos:
         sym = p['symbol']
         u_sym = get_underlying_symbol(sym)
@@ -107,11 +110,12 @@ def run_master_analysis():
         # Calcular DTE
         dte_val = 0
         if q_data.get('expiration_date'):
-            exp_dt = datetime.strptime(q_data['expiration_date'], '%Y-%m-%d')
-            dte_val = (exp_dt - datetime.now()).days
+            try:
+                exp_dt = datetime.strptime(q_data['expiration_date'], '%Y-%m-%d')
+                dte_val = (exp_dt - datetime.now()).days
+            except: dte_val = 0
 
-        # Solo PMCC Leaps
-        if float(p['quantity']) > 0 and delta and abs(delta) > 0.60 and dte_val > 180:
+        if float(p['quantity']) > 0 and delta and abs(delta) > 0.55 and dte_val > 150:
             if u_sym not in report:
                 report[u_sym] = {"leaps": [], "leaps_strikes": [], "realized_cc": 0.0, "closed_list": [], "active_short": None, "spot": m_map.get(u_sym, {}).get('last', 0)}
             
@@ -125,21 +129,23 @@ def run_master_analysis():
                 "Qty": int(float(p['quantity'])), "Cost": cost_basis, "Value": market_val, "P_L": market_val - cost_basis
             })
 
-    # Auditoría de Trades Cerrados
+    # B. Auditoría de Trades Cerrados
     for gl in gl_data:
         sym = gl.get('symbol', '')
         u_sym, o_type, strike = decode_occ_symbol(sym)
         if u_sym in report and o_type == "CALL":
-            close_dt = datetime.strptime(gl.get('close_date','2000-01-01')[:10], '%Y-%m-%d')
-            open_dt = datetime.strptime(gl.get('open_date','2000-01-01')[:10], '%Y-%m-%d')
-            if close_dt >= datetime.strptime(report[u_sym]['leaps'][0]['Adquirido'], '%Y-%m-%d'):
-                is_leap_strike = any(abs(strike - ls) < 0.5 for ls in report[u_sym]['leaps_strikes'])
-                if not is_leap_strike:
-                    gain = float(gl.get('gain_loss', 0))
-                    report[u_sym]['realized_cc'] += gain
-                    report[u_sym]['closed_list'].append({"Cerrado": close_dt.strftime('%Y-%m-%d'), "Strike": strike, "P/L": gain, "DIT": (close_dt-open_dt).days})
+            try:
+                close_dt = datetime.strptime(gl.get('close_date','2000-01-01')[:10], '%Y-%m-%d')
+                leap_acq_dt = datetime.strptime(report[u_sym]['leaps'][0]['Adquirido'], '%Y-%m-%d')
+                if close_dt >= leap_acq_dt:
+                    is_leap_strike = any(abs(strike - ls) < 0.5 for ls in report[u_sym]['leaps_strikes'])
+                    if not is_leap_strike:
+                        gain = float(gl.get('gain_loss', 0))
+                        report[u_sym]['realized_cc'] += gain
+                        report[u_sym]['closed_list'].append({"Cerrado": close_dt.strftime('%Y-%m-%d'), "Strike": strike, "P/L": gain, "DIT": gl.get('term', '-')})
+            except: pass
 
-    # Identificar Corto Activo con cálculos de "Jugo"
+    # C. Identificar Corto Activo
     for p in raw_pos:
         sym = p['symbol']
         u_sym = get_underlying_symbol(sym)
@@ -147,18 +153,24 @@ def run_master_analysis():
             q = m_map.get(sym, {})
             u_p = report[u_sym]['spot']
             strike = q.get('strike', 0)
-            last_price = q.get('last', 0)
+            last_p = q.get('last', 0)
             
-            # Matrícula de Precios
-            initial_price = abs(float(p.get('cost_basis', 0))) / (abs(float(p['quantity'])) * 100)
-            intrinsic = max(0, u_p - strike)
-            extrinsic = last_price - intrinsic
+            # Cálculos de Jugo
+            init_p = abs(float(p.get('cost_basis', 0))) / (abs(float(p['quantity'])) * 100)
+            intr = max(0, u_p - strike)
+            extr = last_p - intr
             
+            # Formatear DTE
+            try:
+                exp_dt = datetime.strptime(q['expiration_date'], '%Y-%m-%d')
+                dte_val = (exp_dt - datetime.now()).days
+            except: dte_val = 0
+
             report[u_sym]['active_short'] = {
-                "Symbol": sym, "Strike": strike, "Price_Init": initial_price, "Price_Last": last_price,
-                "Intrinsic": intrinsic, "Extrinsic": extrinsic,
-                "PL_Ext": initial_price - extrinsic, "PL_Total": (initial_price - last_price) * 100 * abs(float(p['quantity'])),
-                "DTE": (datetime.strptime(q['expiration_date'], '%Y-%m-%d') - datetime.now()).days
+                "Strike": strike, "Price_Init": init_p, "Price_Last": last_p,
+                "Intrinsic": intr, "Extrinsic": extr,
+                "PL_Ext": init_p - extr, "PL_Total": (init_p - last_p) * 100 * abs(float(p['quantity'])),
+                "DTE": dte_val
             }
 
     return {"nl": net_liq, "report": report}
@@ -166,13 +178,12 @@ def run_master_analysis():
 # --- UI ---
 
 if TRADIER_TOKEN:
-    if st.button("🚀 ACTUALIZAR TODO EL SISTEMA"):
+    if st.button("🚀 ACTUALIZAR COMMAND CENTER"):
         data = run_master_analysis()
         if data:
-            nl = data['nl']
             report = data['report']
 
-            # --- NUEVA SECCIÓN: TABLA RESUMEN DE VENTAS (SHORTS) ---
+            # --- TABLA RESUMEN VENTAS (SHORTS) ---
             st.markdown('<div class="section-header">📑 RESUMEN DE VENTAS ACTIVAS (COVERED CALLS)</div>', unsafe_allow_html=True)
             
             summary_list = []
@@ -180,28 +191,21 @@ if TRADIER_TOKEN:
                 if d['active_short']:
                     a = d['active_short']
                     summary_list.append({
-                        "Activo": ticker,
-                        "Strike": a['Strike'],
-                        "Pr. Inicial": a['Price_Init'],
-                        "Pr. Actual": a['Price_Last'],
-                        "Intrínseco": a['Intrinsic'],
-                        "Extrínseco (Jugo)": a['Extrinsic'],
-                        "P/L Jugo": a['PL_Ext'],
-                        "P/L Total ($)": a['PL_Total'],
-                        "DTE": a['DTE']
+                        "Activo": ticker, "Strike": a['Strike'], "Pr. Inicial": a['Price_Init'], "Pr. Actual": a['Price_Last'],
+                        "Intrínseco": a['Intrinsic'], "Extrínseco (Jugo)": a['Extrinsic'], "P/L Jugo": a['PL_Ext'],
+                        "P/L Total ($)": a['PL_Total'], "DTE": a['DTE']
                     })
             
             if summary_list:
                 df_sum = pd.DataFrame(summary_list)
                 st.dataframe(df_sum.style.format({
-                    "Pr. Inicial": "${:.2f}", "Pr. Actual": "${:.2f}",
-                    "Intrínseco": "${:.2f}", "Extrínseco (Jugo)": "${:.2f}",
-                    "P/L Jugo": "${:.2f}", "P/L Total ($)": "${:,.2f}"
+                    "Pr. Inicial": "${:.2f}", "Pr. Actual": "${:.2f}", "Intrínseco": "${:.2f}", 
+                    "Extrínseco (Jugo)": "${:.2f}", "P/L Jugo": "${:.2f}", "P/L Total ($)": "${:,.2f}"
                 }), use_container_width=True)
             else:
-                st.info("No hay ventas cortas activas en las campañas PMCC.")
+                st.info("No hay ventas cortas activas.")
 
-            # --- SECCIÓN POR ACTIVO (TOM KING STYLE) ---
+            # --- DETALLE POR ACTIVO ---
             for ticker, d in report.items():
                 st.markdown(f'<div class="section-header">DETALLE CAMPAÑA: {ticker} (Spot: ${d["spot"]:.2f})</div>', unsafe_allow_html=True)
                 
@@ -215,22 +219,21 @@ if TRADIER_TOKEN:
                 c1.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">COSTO LEAPS</p><p class="kpi-value">${tc:,.2f}</p></div>', unsafe_allow_html=True)
                 c2.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">VALOR ACTUAL</p><p class="kpi-value">${tv:,.2f}</p></div>', unsafe_allow_html=True)
                 c3.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">CC REALIZADO</p><p class="kpi-value" style="color:#4ade80">${re:,.2f}</p></div>', unsafe_allow_html=True)
-                cc4_val = f'<p class="kpi-value">${ni:,.2f}</p>' if ni >= 0 else f'<p class="kpi-value" style="color:#f87171">-${abs(ni):,.2f}</p>'
-                c4.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">NET INCOME</p>{cc4_val}</div>', unsafe_allow_html=True)
-                
-                r_c = "#4ade80" if ro > 0 else "#f87171"
-                c5.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">ROI TOTAL</p><p class="roi-val" style="color:{r_c}">{ro:.1f}%</p></div>', unsafe_allow_html=True)
+                c4.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">NET INCOME</p><p class="kpi-value">${ni:,.2f}</p></div>', unsafe_allow_html=True)
+                r_color = "#4ade80" if ro > 0 else "#f87171"
+                c5.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">ROI TOTAL</p><p class="roi-val" style="color:{r_color}">{ro:.1f}%</p></div>', unsafe_allow_html=True)
 
                 st.write("### 🏛️ CORE POSITION (LEAPS)")
                 st.table(pd.DataFrame(d['leaps']).style.format({"Cost": "${:,.2f}", "Value": "${:,.2f}", "P/L": "${:,.2f}"}))
 
                 if d['active_short']:
                     ash = d['active_short']
-                    st.write(f"### 🥤 MONITOR DE JUGO: Strike {ash['Strike']} | DTE: {ash['DTE']} | **Extrínseco: ${ash['Ext']:.2f}**")
-                    if ash['Ext'] < 0.20: st.error("🚨 TIEMPO DE ROLEAR")
+                    # AQUÍ ESTÁ LA CORRECCIÓN DE LLAVES Y NOMBRES
+                    st.write(f"### 🥤 MONITOR DE JUGO: Strike {ash['Strike']} | DTE: {ash['DTE']} | **Extrínseco: ${ash['Extrinsic']:.2f}**")
+                    if ash['Extrinsic'] < 0.20: st.error("🚨 TIEMPO DE ROLEAR")
 
                 if d['closed_list']:
-                    with st.expander("📔 Ver Historial de Trades Cerrados"):
+                    with st.expander("📔 Ver Historial Cerrado"):
                         st.dataframe(pd.DataFrame(d['closed_list']).sort_values("Cerrado", ascending=False))
                 st.divider()
 
