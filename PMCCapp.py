@@ -178,7 +178,7 @@ if TOKEN:
         data = run_pmcc_audit()
         if data:
             # --- TABLA RESUMEN VENTAS ACTIVAS ---
-            st.markdown('<div class="section-header">📑 RESUMEN DE VENTAS ACTIVAS (COVERED CALLS)</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-header">📑 RESUMEN DE VENTAS ACTIVAS (PMCC)</div>', unsafe_allow_html=True)
             summary_list = []
             for ticker, d in data.items():
                 if d['active_short']:
